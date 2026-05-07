@@ -1,0 +1,55 @@
+// Metropolitan IDL - Example Service Definitions
+// These .dbv files define the memory layout of services that metrod manages.
+// The Brief compiler reads these to generate memory-spec.json for foreign clients.
+
+// ===== Example 1: Weather API Service =====
+// A simple service that takes a city name and returns weather data.
+
+SERVICE WeatherApi {
+    INPUT city: String;
+    OUTPUT temperature: Float;
+    OUTPUT humidity: Float;
+    OUTPUT condition: String;
+}
+
+// ===== Example 2: Image Classifier Service =====
+// A service that accepts image data and returns classification results.
+
+SERVICE ImageClassifier {
+    INPUT img_data: Vector[UInt[8], 4096];
+    OUTPUT label: String;
+    OUTPUT confidence: Float;
+}
+
+// ===== Example 3: Math Accelerator Service =====
+// A service for heavy numerical computations.
+
+SERVICE MathAccelerator {
+    INPUT matrix_a: Vector[Float, 256];
+    INPUT matrix_b: Vector[Float, 256];
+    INPUT operation: String;
+    OUTPUT result: Vector[Float, 256];
+    OUTPUT elapsed_ms: Int;
+}
+
+// ===== Example 4: Key-Value Store Service =====
+// A simple persistent key-value store accessible from any language.
+
+SERVICE KeyValueStore {
+    INPUT key: String;
+    INPUT value: String;
+    INPUT action: String;
+    OUTPUT found: Bool;
+    OUTPUT result_value: String;
+}
+
+// ===== Example 5: Notification Service =====
+// A broadcast service for cross-language notifications.
+
+SERVICE NotificationHub {
+    INPUT channel: String;
+    INPUT message: String;
+    INPUT sender: String;
+    OUTPUT ack: Bool;
+    OUTPUT subscriber_count: Int;
+}

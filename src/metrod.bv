@@ -1,0 +1,110 @@
+// Metro Daemon (metrod) - Metropolitan FFI Broker
+// A reactive state machine that manages shared-memory service registry.
+
+let running: Bool = true;
+let start_time: Int = 0;
+let service_count: Int = 0;
+let total_memory: Int = 0;
+
+let cmd_action: Int = 0;
+let cmd_capacity: Int = 0;
+let cmd_ready: Bool = false;
+
+let resp_success: Bool = false;
+let resp_result: Int = 0;
+let resp_ready: Bool = false;
+
+rct txn init_daemon [start_time == 0]
+  [start_time > 0]
+{
+    &start_time = 1;
+    &running = true;
+    &service_count = 0;
+    &total_memory = 0;
+    term;
+};
+
+rct txn register_service [
+    running == true &&
+    cmd_ready == true &&
+    cmd_action == 1 &&
+    cmd_capacity > 0
+][
+    resp_ready == true &&
+    resp_success == true
+]
+{
+    &service_count = service_count + 1;
+    &total_memory = total_memory + cmd_capacity;
+    &resp_success = true;
+    &resp_result = cmd_capacity;
+    &resp_ready = true;
+    &cmd_ready = false;
+    &cmd_action = 0;
+    term;
+};
+
+rct txn lookup_service [
+    running == true &&
+    cmd_ready == true &&
+    cmd_action == 2
+][
+    resp_ready == true
+]
+{
+    &resp_success = true;
+    &resp_result = 1;
+    &resp_ready = true;
+    &cmd_ready = false;
+    &cmd_action = 0;
+    term;
+};
+
+rct txn deregister_service [
+    running == true &&
+    cmd_ready == true &&
+    cmd_action == 3 &&
+    service_count > 0
+][
+    resp_ready == true &&
+    resp_success == true
+]
+{
+    &service_count = service_count - 1;
+    &resp_success = true;
+    &resp_result = 1;
+    &resp_ready = true;
+    &cmd_ready = false;
+    &cmd_action = 0;
+    term;
+};
+
+rct txn report_status [
+    running == true &&
+    cmd_ready == true &&
+    cmd_action == 4
+][
+    resp_ready == true
+]
+{
+    &resp_result = service_count;
+    &resp_success = true;
+    &resp_ready = true;
+    &cmd_ready = false;
+    &cmd_action = 0;
+    term;
+};
+
+rct txn shutdown_daemon [
+    running == true &&
+    cmd_ready == true &&
+    cmd_action == 5
+][
+    running == false
+]
+{
+    &running = false;
+    &resp_ready = true;
+    &cmd_ready = false;
+    term;
+};
