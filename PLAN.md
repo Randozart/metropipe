@@ -146,10 +146,57 @@ echo "payload" | metropipe proxy WeatherApi > response.bin
 
 Files: `src/proxy.rs`
 
-### Phase S: Standalone Binary (1 day)
+### Phase S: Standalone Binary ✅
 `cargo install metropipe` — zero dependencies. The brief-compiler becomes optional.
 
 Files: `Cargo.toml`, `src/main.rs`
+
+### Phase X: Cross-Platform Paths ✅
+`resolve_shm_path()` tries `$METROPIPE_DIR`, `/dev/shm`, `/tmp`, `./.metropipe` — works everywhere.
+
+### Phase E: `metropipe export <function> <source> [--target lang...] [--out <dir>] [--namespace|--flat|--unify]`
+
+Read a function from a source file, generate typed stubs + provider in targeted languages.
+
+#### Command
+```
+metropipe export classify services.py --target rust go c --out ./api
+```
+
+#### Arguments
+- `<function>` — the function name to export
+- `<source>` — path to the source file (extension determines language)
+- `--target <lang>` — repeatable, one per target language (default: all 9)
+- `--out <dir>` — output directory (default: `./metropipe`)
+
+#### Output modes
+- `--namespace` (default): `metropipe/classify/stub.rs`, `metropipe/classify/provider.py`
+- `--flat`: `metropipe/classify.rs`, `metropipe/classify.py`
+- `--unify`: `metropipe.rs`, `metropipe.py` (all exports merged)
+
+#### Per-language function parsers
+Extract name, parameter types, and return types from source:
+- `.py` — `def fn(params) -> type:`
+- `.rs` — `fn name(params) -> type`
+- `.go` — `func Name(params) type`
+- `.c` / `.h` — `type name(params)`
+- `.js` / `.mjs` — `function name(params)`
+- `.ts` — `function name(params): type`
+- `.rb` — `def name(params)`
+- `.java` — `type name(params)`
+- `.cs` — `type Name(params)`
+
+Unknown `.xyz` → raw bytes stub.
+
+#### Provider generation
+For each exported function, generate a provider script in the source language:
+- Imports the real function from the source file
+- Opens a metropipe channel named after the function
+- Runs the poll loop: `wait_request()` → deserialize → call → serialize → `send_response()`
+
+User runs: `python3 metropipe/classify/provider.py`
+
+Files: `src/export.rs`, `src/codegen.rs` (extended)
 
 ## Welding Hierarchy — Complete
 

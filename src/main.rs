@@ -3,6 +3,7 @@ use std::process;
 mod channel;
 mod codegen;
 mod connect;
+mod export;
 mod proxy;
 
 /// Print usage information for the metropipe CLI.
@@ -10,13 +11,17 @@ fn print_usage() {
     eprintln!("metropipe — share data between processes on the same machine");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  metropipe connect <service>          Interactive REPL (default)");
-    eprintln!("  metropipe connect <service> --send   Send one request, print response, exit");
-    eprintln!("  metropipe connect <service> --listen Act as provider (receive requests)");
-    eprintln!("  metropipe connect <service> --gen-stubs  Generate client stubs for 9 languages");
-    eprintln!("  metropipe bind <library>             Generate .dbv + stubs from a library");
-    eprintln!("  metropipe proxy <service>            stdin/stdout bridge for any language");
-    eprintln!("  metropipe --help                     Show this help");
+    eprintln!("  metropipe export <func> <source>          Export a function, generate stubs + provider");
+    eprintln!("    [--target <lang> <lang> ...]              Languages for stubs (default: all 9)");
+    eprintln!("    [--out <dir>]                              Output directory (default: ./metropipe)");
+    eprintln!("    [--namespace|--flat|--unify]               Output mode (default: --namespace)");
+    eprintln!("  metropipe connect <service>                Interactive REPL");
+    eprintln!("  metropipe connect <service> --send <data>  One-shot RPC");
+    eprintln!("  metropipe connect <service> --listen       Act as provider (receive requests)");
+    eprintln!("  metropipe connect <service> --gen-stubs    Generate client stubs for 9 languages");
+    eprintln!("  metropipe bind <library>                   Generate stubs from a library");
+    eprintln!("  metropipe proxy <service>                  stdin/stdout bridge for any language");
+    eprintln!("  metropipe --help                           Show this help");
 }
 
 /// Entry point for the metropipe binary. Dispatches to subcommands.
@@ -28,6 +33,13 @@ fn main() {
     }
 
     let result = match args[1].as_str() {
+        "export" => {
+            if args.len() < 4 {
+                eprintln!("Error: Usage: metropipe export <function> <source> [--target <lang>...] [--out <dir>]");
+                process::exit(1);
+            }
+            export::run_export(&args[2..])
+        }
         "connect" => {
             if args.len() < 3 {
                 eprintln!("Error: Missing service name");
