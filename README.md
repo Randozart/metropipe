@@ -1,24 +1,35 @@
 # metropipe
 
-Export a function from one language and call it from another.
+Generates the code needed to call a function across processes on the same machine. If the function lives in another process, metropipe writes shared memory stubs. If it lives in the same process, metropipe can generate C function pointer stubs or linker-ready `.so` files — these are the same C ABI you'd use otherwise, just automated from your function signature.
+
+## Where it fits
+
+| Situation | metropipe gives you | Notes |
+|-----------|---------------------|-------|
+| Same machine, different processes, different languages | Shared memory stubs with zero-copy layout. The generated code handles mmap, handshake, and byte layout. No server, no serialization, no configuration. | Faster than gRPC on localhost. No protos, no daemon. Without metropipe you'd write this from scratch for every language combination. |
+| Same machine, same process, two languages | Generated C stubs. `c-direct` produces a function pointer registry. `c-linker` produces a `.h` + `.c` + Makefile you compile to a `.so`. | These use the same C ABI you'd write by hand. metropipe generates them from your function signature so you don't type the boilerplate. |
+| Different machines | Not the right tool. metropipe doesn't do networking. Use gRPC, Thrift, or HTTP. |
+| Async queuing or persistence | Not the right tool. metropipe doesn't store or queue messages. Use Kafka, NATS, or Redis. |
 
 ## How it works
 
-You have a Python function `classify()` in `services.py`. You want Rust code and Go code to call it.
+You have a Python function `classify()` in `services.py`. You want to call it from Rust or Go.
 
 ```bash
 metropipe export classify services.py --target rust go
 ```
 
-This reads the function signature from `services.py` and generates Rust and Go stubs with matching types. It also generates `metropipe/classify/provider.py`, which imports your real `classify()` and runs it in a loop, listening for requests.
+This reads the function signature from `services.py` and generates Rust and Go stubs with matching types. It also generates a provider script (`metropipe/classify/provider.py`) that imports your real `classify()` and runs it in a loop, waiting for requests over shared memory.
 
 ```bash
 python3 metropipe/classify/provider.py &
 ```
 
-Now any Rust or Go process on the same machine can call `classify()` as if it were a local function. The generated stub writes arguments directly into a shared memory buffer at known byte offsets, sets a status flag, and waits for the provider to write back. No serialization, no JSON, just raw bytes at deterministic positions.
+Now any process on the same machine that imports the generated Rust or Go stub can call `classify()` and get a result back. The stub writes arguments into a shared memory buffer at computed byte offsets, sets a status flag, and waits for the provider to respond. The provider reads the buffer, calls your real function, and writes the result back.
 
-The shared memory file (`/dev/shm/metro_classify`) is created on first use. No server, no daemon, no configuration.
+For cross-process stubs, metropipe calculates a binary layout where each parameter has a fixed byte offset: 4 bytes for int, 4 for float, 256 for string, 1 for bool. The generated stubs and the provider both know this layout — no serialization or encoding between them.
+
+The shared memory file is created on first use. There is no server, daemon, or configuration.
 
 ## Commands
 
@@ -28,31 +39,25 @@ The shared memory file (`/dev/shm/metro_classify`) is created on first use. No s
 metropipe export <function> <source> --target <lang> <lang> ...
 ```
 
-The `--target` flag accepts any of these: `c` (shared memory), `c-direct` (function pointer registry), `c-linker` (compiled `.so`), `go`, `python`, `java`, `rust`, `csharp`, `js`, `ruby`, `bash`. If omitted, stubs are generated for all of them.
+Supported targets: `c-direct`, `c-linker`, `c` (shared memory), `go`, `python`, `java`, `rust`, `csharp`, `js`, `ruby`, `bash`.
 
-The three C targets serve different use cases:
+The three C targets:
 
-| Target | Latency | Setup | Best for |
-|--------|---------|-------|----------|
-| `c-direct` | ~2ns | Provider calls `metropipe_register()` at startup. Consumer gets a function pointer from `metropipe_get_registry()`. No compilation, no shared memory. | Same-process embedding where both sides are compiled together. |
-| `c-linker` | ~1ns | Generates `.h` + `.c` + `Makefile`. Run `make` to produce a `.so`. Link with `-lclassify`. | Same-process ABI boundary. Standard C FFI. |
-| `c` | ~10ns | Shared memory stub. No compilation, no linking. Provider runs independently. | Cross-process communication. Hot-reloadable. |
+- `c-direct` — generates a function pointer registry. Open `registry.h`, call `metropipe_get_registry()->classify(args)`. This is the same mechanism as a manual C plugin system, but metropipe writes the registration and lookup code.
+- `c-linker` — generates `.h` + `.c` + `Makefile`. Run `make` to produce `libclassify.so`. This is the same process as writing a shared library by hand, but metropipe generates the interface files.
+- `c` — shared memory stub for cross-process calls. No compilation, no linking, no server.
 
-Output can be structured three ways:
+Output modes:
 
-- `--namespace` (default) creates a directory per function: `metropipe/classify/stub.rs`
-- `--flat` puts stubs in a single directory: `metropipe/classify.rs`
-- `--unify` merges all exported functions into one file per language: `metropipe.rs`
+- `--namespace` (default): `metropipe/classify/stub.rs`
+- `--flat`: `metropipe/classify.rs`
+- `--unify`: `metropipe.rs` (appends on subsequent exports)
 
-Use `--out <dir>` to change where files are written.
+Use `--out <dir>` to change output directory.
 
-If you run `export` without a source file, it generates generic stubs that you can fill in with your own logic:
+Without a source file, generates raw-bytes stubs you fill in yourself.
 
-```bash
-metropipe export Classifier
-```
-
-The source language is guessed from the file extension. Supported: `.py`, `.rs`, `.go`, `.c`, `.h`, `.js`, `.mjs`, `.ts`, `.rb`, `.java`, `.cs`.
+Source language detection from extension: `.py`, `.rs`, `.go`, `.c`, `.h`, `.js`, `.mjs`, `.ts`, `.rb`, `.java`, `.cs`. Unknown extensions produce raw-bytes stubs.
 
 ### connect
 
@@ -60,45 +65,37 @@ The source language is guessed from the file extension. Supported: `.py`, `.rs`,
 metropipe connect WeatherApi
 ```
 
-Opens the shared memory channel for a service and lets you send requests interactively. Each line is sent as a request, the response is printed.
-
-- `--send <data>` sends one request and exits.
-- `--listen` puts you in provider mode.
-- `--gen-stubs` generates client stub files for all supported languages.
+Interactive REPL over a shared memory channel. Lines are sent as request payloads, responses are printed. `--send <data>` for one-shot, `--listen` to act as provider, `--gen-stubs` to generate client library files.
 
 ### proxy
 
-For languages that can't call mmap (Bash, AWK, Perl, etc.), `proxy` wraps the shared memory handshake as stdin/stdout:
+Wraps the shared memory handshake as stdin/stdout. For languages that cannot call mmap (Bash, AWK, Perl, etc.):
 
 ```bash
-echo "New York" | metropipe proxy WeatherApi > response.bin
+echo "payload" | metropipe proxy WeatherApi > response.bin
 ```
 
 ### bind
 
-```bash
-metropipe bind mylib.h
-```
-
-Reads a C header file and generates stubs for all supported languages.
+Reads a C header and generates stubs for all supported languages. Useful when you already have a library interface defined.
 
 ## Zero-copy layout
 
-The `export` command knows the function signature — parameter names, types, and their order. Instead of serializing to JSON, it calculates fixed byte positions for each parameter:
+Since `export` knows the function signature at generation time, it calculates fixed byte offsets for each parameter. Both the stub and the provider use the same layout:
 
-| Type | Size in buffer |
-|------|---------------|
-| int32 / float | 4 bytes |
-| int64 / double | 8 bytes |
+| Type | Buffer size |
+|------|-------------|
+| int32, float | 4 bytes |
+| int64, double | 8 bytes |
 | String | 256 bytes |
 | bool | 1 byte |
-| Data / bytes | 4096 bytes |
+| Data, bytes | 4096 bytes |
 
-Both the generated stub and the generated provider know this layout. Writing and reading happens at known offsets — no encoding, no decoding, no allocation.
+No encoding, no decoding, no allocation during the call.
 
 ## Protocol
 
-Shared memory channels use a 32-byte header at the start of the file:
+Shared memory channels use a 32-byte header at the file start:
 
 - bytes 0-3: status word (0=idle, 1=request, 3=response, 4=error)
 - bytes 4-7: atomic lock
@@ -108,15 +105,13 @@ Shared memory channels use a 32-byte header at the start of the file:
 - bytes 20-31: reserved
 - bytes 32 onward: payload (zero-copy layout)
 
-The consumer writes data at the correct byte offsets, sets status to 1. The provider sees the change, processes, writes the result at the correct offsets, sets status to 3. The consumer reads and resets status to 0.
-
-The file path is `/dev/shm/metro_<name>` on Linux, `/tmp/metro_<name>` on macOS, or `./.metropipe/metro_<name>` as fallback. Set `METROPIPE_DIR` to use a different directory.
+Path resolution: `/dev/shm/metro_<name>` (Linux), `/tmp/metro_<name>` (macOS), `./.metropipe/metro_<name>` (fallback). Override with `METROPIPE_DIR`.
 
 ## Language Support
 
-| Language | Generated stub | How it connects |
-|----------|---------------|-----------------|
-| C (shm) | `stub.h` | mmap + atomic operations |
+| Target | Generated file(s) | Mechanism |
+|--------|-------------------|-----------|
+| C (shm) | `stub.h` | mmap + atomics |
 | C (direct) | `registry.h` | function pointer table |
 | C (linker) | `.h` + `.c` + `Makefile` | compiled `.so` |
 | Go | `stub.go` | syscall.Mmap |
@@ -127,21 +122,6 @@ The file path is `/dev/shm/metro_<name>` on Linux, `/tmp/metro_<name>` on macOS,
 | JavaScript | `stub.js` | SharedArrayBuffer |
 | Ruby | `stub.rb` | IO.mmap |
 | Bash | `stub.sh` | calls metropipe proxy |
-
-## Project Structure
-
-```
-metropipe/
-├── src/
-│   ├── main.rs       # CLI: export, connect, bind, proxy
-│   ├── export.rs     # Function parsing + stub generation
-│   ├── channel.rs    # 32-byte header protocol
-│   ├── connect.rs    # Interactive REPL
-│   ├── codegen.rs    # Legacy stub generator
-│   └── proxy.rs      # stdin/stdout bridge
-├── Cargo.toml
-└── docs/METROPOLITAN-SPEC.md
-```
 
 ## Install
 
