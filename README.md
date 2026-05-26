@@ -14,17 +14,9 @@ Or download a pre-built binary from the [releases page](https://github.com/Rando
 
 ## Commands
 
-### `metropipe serve` — start the daemon
+### `metropipe connect <name>` — send and receive over shared memory
 
-Allocates shared memory channels in `/dev/shm/` and waits for clients.
-
-```bash
-metropipe serve
-```
-
-### `metropipe connect <name>` — interactive REPL
-
-Opens a channel, reads lines from stdin, sends each as a request, prints the response.
+Creates the channel if it doesn't exist, then connects. Default mode is an interactive REPL.
 
 ```bash
 metropipe connect WeatherApi
@@ -37,6 +29,8 @@ Flags:
 - `--send <data>` — one-shot: send once, print response, exit
 - `--listen` — act as the provider: receive requests, prompt for responses
 - `--gen-stubs [<dir>]` — generate client library files for 9 languages
+
+No server or daemon needed. The shared memory file IS the channel — any process can create it.
 
 ### `metropipe bind <library>` — generate client stubs
 
@@ -94,14 +88,14 @@ Communication follows: idle → consumer writes → consumer signals request →
 
 ## How it works
 
-1. `metropipe serve` creates a file at `/dev/shm/metro_<name>` with the 32-byte header + zero-filled payload.
+1. The first process to connect creates a file at `/dev/shm/metro_<name>` with the 32-byte header + zero-filled payload.
 2. A client opens the file, memory-maps it, and writes a request to the payload region.
 3. The client sets STATUS_WORD to `1` (CONSUMER_REQ) via an atomic store.
 4. The provider polls STATUS_WORD. When it sees `1`, it processes the request and writes back.
 5. The provider sets STATUS_WORD to `3` (PROVIDER_RES) when done.
 6. The client reads the response and resets STATUS_WORD to `0` (IDLE).
 
-The same buffer, header, and handshake work for every language. No serialization, no function calls, no `.so` files.
+No daemon, no central registry, no server process. The file path `/dev/shm/metro_<name>` IS the channel — any process that knows the name can join by opening and mmap-ing the same file.
 
 ## Project Structure
 

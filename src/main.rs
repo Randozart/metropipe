@@ -4,20 +4,18 @@ mod channel;
 mod codegen;
 mod connect;
 mod proxy;
-mod server;
 
 /// Print usage information for the metropipe CLI.
 fn print_usage() {
-    eprintln!("metropipe — Universal Language Binder");
+    eprintln!("metropipe — share data between processes on the same machine");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  metropipe serve                     Start the daemon");
-    eprintln!("  metropipe connect <service>          Interactive REPL");
-    eprintln!("  metropipe connect <service> --send   One-shot RPC");
-    eprintln!("  metropipe connect <service> --listen Act as provider");
-    eprintln!("  metropipe connect <service> --gen-stubs  Generate client stubs");
+    eprintln!("  metropipe connect <service>          Interactive REPL (default)");
+    eprintln!("  metropipe connect <service> --send   Send one request, print response, exit");
+    eprintln!("  metropipe connect <service> --listen Act as provider (receive requests)");
+    eprintln!("  metropipe connect <service> --gen-stubs  Generate client stubs for 9 languages");
     eprintln!("  metropipe bind <library>             Generate .dbv + stubs from a library");
-    eprintln!("  metropipe proxy <service>            stdin/stdout bridge");
+    eprintln!("  metropipe proxy <service>            stdin/stdout bridge for any language");
     eprintln!("  metropipe --help                     Show this help");
 }
 
@@ -30,7 +28,6 @@ fn main() {
     }
 
     let result = match args[1].as_str() {
-        "serve" => server::run_serve(),
         "connect" => {
             if args.len() < 3 {
                 eprintln!("Error: Missing service name");
