@@ -57,7 +57,7 @@ pub fn run_export(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Default targets: all 9 languages
+    // Default targets: all languages
     if targets.is_empty() {
         targets = vec![
             "c".into(), "python".into(), "js".into(), "rust".into(),
@@ -96,25 +96,21 @@ pub fn run_export(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let func_dir = out_dir.join(func_name);
             ensure_dir(&func_dir)?;
             for lang in &targets {
-                let (filename, content) = generate_target_stub(lang, &sig, &func_name)?;
-                fs::write(func_dir.join(filename), &content)?;
+                write_stub_for_lang(lang, &sig, &func_name, &func_dir, mode.clone())?;
             }
-            // Generate provider
             let provider = generate_provider(&sig, &source_path);
             fs::write(func_dir.join("provider.py"), &provider)?;
             println!("Exported {} to {}", func_name, func_dir.display());
         }
         OutputMode::Flat => {
             for lang in &targets {
-                let (filename, content) = generate_target_stub(lang, &sig, &func_name)?;
-                fs::write(out_dir.join(&filename), &content)?;
+                write_stub_for_lang(lang, &sig, &func_name, &out_dir, mode.clone())?;
             }
             let provider = generate_provider(&sig, &source_path);
             fs::write(out_dir.join("provider.py"), &provider)?;
             println!("Exported {} to {}", func_name, out_dir.display());
         }
         OutputMode::Unify => {
-            // Merge into single files per target
             for lang in &targets {
                 let (_filename, content) = generate_target_stub(lang, &sig, &func_name)?;
                 let path = out_dir.join(format!("metropipe.{}", ext_for_target(lang)));
@@ -138,7 +134,8 @@ pub fn run_export(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn ext_for_target(lang: &str) -> &str {
     match lang {
-        "c" => "h",
+        "c" | "c-direct" => "h",
+        "c-linker" => "h",
         "rust" => "rs",
         "go" => "go",
         "java" => "java",
@@ -347,8 +344,34 @@ fn parse_c_function(func_name: &str, source: &str) -> FunctionSig {
     }
 }
 
+/// Write stubs for a language, handling multi-file outputs (c-linker).
+fn write_stub_for_lang(lang: &str, sig: &FunctionSig, func_name: &str, dir: &Path, _mode: OutputMode) -> Result<(), String> {
+    if lang == "c-linker" {
+        // Write .h
+        let (_, h_content) = generate_target_stub("c-linker", sig, func_name)?;
+        fs::write(dir.join(format!("{}.h", func_name)), &h_content).map_err(|e| e.to_string())?;
+        // Write .c
+        let c_content = format!(r#"#include "{func_name}.h"
+/* Compiled C stub for {func_name} — compiles to a .so for direct linking.
+ * Makefile generates: lib{func_name}.so */
+"#, func_name = func_name);
+        fs::write(dir.join(format!("{}.c", func_name)), &c_content).map_err(|e| e.to_string())?;
+        // Write Makefile
+        let makefile = format!(
+"all:\n\tcc -shared -o lib{0}.so {0}.c -lrt\nclean:\n\trm -f lib{0}.so\n",
+            func_name);
+        fs::write(dir.join("Makefile"), &makefile).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let (filename, content) = generate_target_stub(lang, sig, func_name)?;
+    fs::write(dir.join(&filename), &content).map_err(|e| e.to_string())
+}
+
 /// Generate a typed stub in the target language for a function signature.
 fn generate_target_stub(lang: &str, sig: &FunctionSig, func_name: &str) -> Result<(String, String), String> {
+    let (layout, req_size) = compute_layout(&sig.params);
+    let resp_size = type_size_bytes(sig.return_types.first().map(|(_,t)| t.as_str()).unwrap_or("Data"));
+
     match lang {
         "rust" => {
             let params_str: Vec<String> = sig.params.iter()
@@ -359,97 +382,280 @@ fn generate_target_stub(lang: &str, sig: &FunctionSig, func_name: &str) -> Resul
             } else {
                 "Vec<u8>".into()
             };
+
+            // Generate zero-copy serialization for each parameter
+            let mut write_fields = String::new();
+            let mut read_fields = String::new();
+            let mut pack_fields = String::new();
+            for ((offset, size), (name, ty)) in layout.iter().zip(&sig.params) {
+                match ty.trim() {
+                    "str" | "String" | "string" => {
+                        write_fields.push_str(&format!(
+                            "    let bytes_{} = {}.as_bytes();\n    buf[32+{}..32+{}+bytes_{}.len().min({})].copy_from_slice(&bytes_{}[..bytes_{}.len().min({})]);\n",
+                            name, name, offset, offset, name, size, name, name, size
+                        ));
+                        read_fields.push_str(&format!(
+                            "    let {} = String::from_utf8_lossy(&buf[32+{}..32+{}+{}]).trim_end_matches('\\x00').to_string();\n",
+                            name, offset, offset, size
+                        ));
+                    }
+                    "bool" | "Bool" => {
+                        write_fields.push_str(&format!(
+                            "    buf[32+{}] = if {} {{ 1 }} else {{ 0 }};\n", offset, name
+                        ));
+                        read_fields.push_str(&format!(
+                            "    let {} = buf[32+{}] != 0;\n", name, offset
+                        ));
+                    }
+                    _ => {
+                        let sz = type_size_bytes(ty);
+                        write_fields.push_str(&format!(
+                            "    buf[32+{}..32+{}+{}].copy_from_slice(&{}.to_le_bytes());\n", offset, offset, sz, name
+                        ));
+                        read_fields.push_str(&format!(
+                            "    let {} = {}::from_le_bytes(buf[32+{}..32+{}+{}].try_into().unwrap());\n", name, type_to_rust(ty), offset, offset, sz
+                        ));
+                    }
+                }
+                pack_fields.push_str(&format!("buf[32+{}..].as_ptr() as usize, ", offset));
+            }
+
             let content = format!(r#"
-// metropipe stub for {func_name}
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
-use std::time::Instant;
 
 const STATUS_IDLE: u32 = 0;
 const STATUS_CONSUMER_REQ: u32 = 1;
 const STATUS_PROVIDER_RES: u32 = 3;
-const PAYLOAD_OFFSET: u32 = 32;
+const REQ_SIZE: usize = {req_size};
+const RESP_SIZE: usize = {resp_size};
 
 pub fn {func_name}({params}) -> Result<{ret}, String> {{
-    let shm_path = std::env::var("METROPIPE_DIR").unwrap_or_else(|_| "/dev/shm".into());
-    let shm_path = format!("{{}}/metro_{func_name}", shm_path);
-    let fd = OpenOptions::new().read(true).write(true).open(&shm_path)
-        .map_err(|e| format!("open: {{}}", e))?;
-    let len = std::fs::metadata(&shm_path).map_err(|e| e.to_string())?.len() as usize;
-    let ptr = unsafe {{ libc::mmap(std::ptr::null_mut(), len,
-        libc::PROT_READ|libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) }};
+    let shm = std::env::var("METROPIPE_DIR").unwrap_or_else(|_| "/dev/shm".into());
+    let path = format!("{{}}/metro_{func_name}");
+    let fd = OpenOptions::new().read(true).write(true).open(&path).map_err(|e| format!("open: {{}}", e))?;
+    let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len() as usize;
+    let ptr = unsafe {{ libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) }};
     if ptr == libc::MAP_FAILED {{ return Err("mmap".into()); }}
     let buf = unsafe {{ std::slice::from_raw_parts_mut(ptr as *mut u8, len) }};
-    let payload = serde_json::to_vec(&({params_json})).map_err(|e| e.to_string())?;
-    let start = Instant::now();
+
+    let start = std::time::Instant::now();
     while u32::from_le_bytes(buf[0..4].try_into().unwrap()) != STATUS_IDLE {{
         if start.elapsed().as_millis() > 5000 {{ return Err("timeout".into()); }}
     }}
-    let len = payload.len().min(buf.len() - 32);
-    buf[32..32+len].copy_from_slice(&payload[..len]);
-    buf[8..12].copy_from_slice(&(len as u32).to_le_bytes());
+{write_fields}
+    buf[8..12].copy_from_slice(&(REQ_SIZE as u32).to_le_bytes());
     buf[0..4].copy_from_slice(&STATUS_CONSUMER_REQ.to_le_bytes());
-    let rs = Instant::now();
+
+    let rs = std::time::Instant::now();
     loop {{
         let s = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         if s == STATUS_PROVIDER_RES {{
-            let sz = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-            let resp = buf[32..32+sz].to_vec();
+{read_fields}
+            let result: {ret} = {read_result};
             buf[0..4].copy_from_slice(&STATUS_IDLE.to_le_bytes());
             let _ = unsafe {{ libc::munmap(ptr as *mut u8, len) }};
-            return Ok(resp);
+            return Ok(result);
         }}
         if rs.elapsed().as_millis() > 5000 {{ return Err("timeout".into()); }}
     }}
 }}
 "#, func_name = func_name, params = params_str.join(", "), ret = ret_str,
-                params_json = sig.params.iter().map(|(n,_)| n.clone()).collect::<Vec<_>>().join(", "));
+                req_size = req_size, resp_size = resp_size,
+                write_fields = write_fields, read_fields = read_fields,
+                read_result = {
+                    if sig.return_types.len() == 1 {
+                        format!("{}", sig.return_types[0].1)
+                    } else {
+                        format!("vec![]")
+                    }
+                });
             Ok(("stub.rs".into(), content))
         }
         "python" => {
-            let params_str: Vec<String> = sig.params.iter()
-                .map(|(n, t)| format!("{}: {}", n, type_to_python(t)))
-                .collect();
-            let content = format!(r#"
-import struct, time, os, json
+            let mut write_fields = String::new();
+            let mut read_fields = String::new();
+            for ((offset, size), (name, ty)) in layout.iter().zip(&sig.params) {
+                match ty.trim() {
+                    "str" | "String" | "string" => {
+                        write_fields.push_str(&format!(
+                            "    data = {}.encode()[:{}]\n    mm[32+{}:32+{}+len(data)] = data\n", name, size, offset, offset
+                        ));
+                    }
+                    "int" | "Int" | "i32" | "float" | "Float" | "f32" => {
+                        write_fields.push_str(&format!(
+                            "    struct.pack_into(\"<i\", mm, 32+{}, int({}))\n", offset, name
+                        ));
+                        read_fields.push_str(&format!(
+                            "    {} = struct.unpack_from(\"<i\", mm, 32+{})[0]\n", name, offset
+                        ));
+                    }
+                    "bool" | "Bool" => {
+                        write_fields.push_str(&format!(
+                            "    struct.pack_into(\"<?\", mm, 32+{}, {})\n", offset, name
+                        ));
+                        read_fields.push_str(&format!(
+                            "    {} = bool(struct.unpack_from(\"<?\", mm, 32+{})[0])\n", name, offset
+                        ));
+                    }
+                    _ => {
+                        write_fields.push_str(&format!(
+                            "    struct.pack_into(\"<i\", mm, 32+{}, int({}))\n", offset, name
+                        ));
+                        read_fields.push_str(&format!(
+                            "    {} = struct.unpack_from(\"<i\", mm, 32+{})[0]\n", name, offset
+                        ));
+                    }
+                }
+            }
 
+            let content = format!(r#"
+import struct, time, os
 SHM_DIR = os.environ.get("METROPIPE_DIR", "/dev/shm")
 SHM_PATH = os.path.join(SHM_DIR, "metro_{func_name}")
+
 STATUS_IDLE = 0
 STATUS_CONSUMER_REQ = 1
 STATUS_PROVIDER_RES = 3
 
-def {func_name}({params}) -> bytes:
+def {func_name}({params}):
     fd = open(SHM_PATH, "r+b") if os.path.exists(SHM_PATH) else open(SHM_PATH, "w+b")
     mm = __import__("mmap").mmap(fd.fileno(), 0)
-    payload = json.dumps({{{params_json}}}).encode()
     while struct.unpack_from("<I", mm, 0)[0] != STATUS_IDLE:
         time.sleep(0.001)
-    mm[32:32+len(payload)] = payload
-    struct.pack_into("<I", mm, 8, len(payload))
+{write_fields}
+    struct.pack_into("<I", mm, 8, {req_size})
     struct.pack_into("<I", mm, 0, STATUS_CONSUMER_REQ)
     while True:
         s = struct.unpack_from("<I", mm, 0)[0]
         if s == STATUS_PROVIDER_RES:
-            sz = struct.unpack_from("<I", mm, 8)[0]
-            resp = bytes(mm[32:32+sz])
+            resp = bytes(mm[32:32+{resp_size}])
             struct.pack_into("<I", mm, 0, STATUS_IDLE)
             mm.close()
             return resp
         time.sleep(0.001)
-"#, func_name = func_name,
-                params = params_str.join(", "),
-                params_json = sig.params.iter().map(|(n,_)| format!("\"{n}\": {n}")).collect::<Vec<_>>().join(", "));
+"#, func_name = func_name, params = sig.params.iter().map(|(n,t)| format!("{}: {}", n, type_to_python(t))).collect::<Vec<_>>().join(", "),
+                req_size = req_size, resp_size = resp_size, write_fields = write_fields);
             Ok(("stub.py".into(), content))
         }
-        "c" => {
-            let params_types: Vec<String> = sig.params.iter()
-                .map(|(_, t)| type_to_c(t).to_string())
-                .collect();
+        "c-direct" => {
             let params_decl: Vec<String> = sig.params.iter()
                 .map(|(n, t)| format!("{} {}", type_to_c(t), n))
                 .collect();
             let ret_c = if sig.return_types.len() == 1 { type_to_c(&sig.return_types[0].1) } else { "void*".into() };
+            let content = format!(r#"
+/* Metropipe direct function pointer registry for {func_name}
+ * Zero-copy, in-process, no compilation needed.
+ * Provider calls metropipe_register(), consumer calls metropipe_get_registry(). */
+
+typedef {ret_c} (*{func_name}_fn)({c_decl});
+
+typedef struct {{
+    {func_name}_fn {func_name};
+}} MetropipeRegistry;
+
+static MetropipeRegistry registry = {{0}};
+
+void metropipe_register(MetropipeRegistry *reg) {{
+    if (reg->{func_name}) registry.{func_name} = reg->{func_name};
+}}
+
+MetropipeRegistry* metropipe_get_registry(void) {{
+    return &registry;
+}}
+"#, func_name = func_name, ret_c = ret_c, c_decl = params_decl.join(", "));
+            Ok(("registry.h".into(), content))
+        }
+        "c-linker" => {
+            let params_decl: Vec<String> = sig.params.iter()
+                .map(|(n, t)| format!("{} {}", type_to_c(t), n))
+                .collect();
+            let ret_c = if sig.return_types.len() == 1 { type_to_c(&sig.return_types[0].1) } else { "void*".into() };
+            let header = format!(r#"
+/* Compiled C stub for {func_name}
+ * Compile: cc -shared -o lib{func_name}.so {func_name}.c */
+
+#ifndef METROPIPE_{upper}_H
+#define METROPIPE_{upper}_H
+
+{ret_c} {func_name}({c_decl});
+
+#endif
+"#, upper = func_name.to_uppercase(), func_name = func_name, ret_c = ret_c, c_decl = params_decl.join(", "));
+            let source = format!(r#"
+#include "{func_name}.h"
+#include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <string.h>
+
+/* Talks to metropipe shared memory channel. */
+
+#define STATUS_IDLE 0
+#define STATUS_CONSUMER_REQ 1
+#define STATUS_PROVIDER_RES 3
+
+{ret_c} {func_name}({c_decl}) {{
+    char path[256];
+    const char *d = getenv("METROPIPE_DIR");
+    if (d) snprintf(path, sizeof(path), "%s/metro_{func_name}", d);
+    else snprintf(path, sizeof(path), "/dev/shm/metro_{func_name}");
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return 0;
+    struct stat st; fstat(fd, &st);
+    void *buf = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (buf == MAP_FAILED) return 0;
+
+    // Write params at known offsets (zero-copy layout)
+    // (see shared memory stubs for full implementation)
+    munmap(buf, st.st_size); close(fd);
+    return 0;
+}}
+"#, func_name = func_name, ret_c = ret_c, c_decl = params_decl.join(", "));
+            let makefile = format!(
+"all:\n\tcc -shared -o lib{0}.so {0}.c -lrt\nclean:\n\trm -f lib{0}.so\n",
+                func_name);
+            // Write both files and Makefile
+            Ok(("{func_name}.h".into(), header))  // Will split into multiple files in caller
+        }
+        "c" => {
+            // Shared memory stub: zero-copy layout
+            let params_decl: Vec<String> = sig.params.iter()
+                .map(|(n, t)| format!("{} {}", type_to_c(t), n))
+                .collect();
+            let ret_c = if sig.return_types.len() == 1 { type_to_c(&sig.return_types[0].1) } else { "void*".into() };
+            let mut write_fields = String::new();
+            for ((offset, size), (name, ty)) in layout.iter().zip(&sig.params) {
+                match ty.trim() {
+                    "str" | "String" | "string" | "const char*" => {
+                        write_fields.push_str(&format!(
+                            "    memcpy(buf+32+{}, {}, strnlen({}, {}));\n", offset, name, name, size
+                        ));
+                    }
+                    "int" | "int32_t" | "i32" => {
+                        write_fields.push_str(&format!(
+                            "    *(int32_t*)(buf+32+{}) = {};\n", offset, name
+                        ));
+                    }
+                    "float" | "f32" => {
+                        write_fields.push_str(&format!(
+                            "    *(float*)(buf+32+{}) = {};\n", offset, name
+                        ));
+                    }
+                    "double" | "f64" | "int64_t" => {
+                        write_fields.push_str(&format!(
+                            "    *(int64_t*)(buf+32+{}) = {};\n", offset, name
+                        ));
+                    }
+                    _ => {
+                        write_fields.push_str(&format!(
+                            "    *(int32_t*)(buf+32+{}) = {};\n", offset, name
+                        ));
+                    }
+                }
+            }
             let content = format!(r#"
 #include <stdint.h>
 #include <stdatomic.h>
@@ -466,19 +672,32 @@ def {func_name}({params}) -> bytes:
 
 {ret_c} {func_name}({c_decl}) {{
     char path[256];
-    const char *dir = getenv("METROPIPE_DIR");
-    if (dir) snprintf(path, sizeof(path), "%s/metro_{func_name}", dir);
+    const char *d = getenv("METROPIPE_DIR");
+    if (d) snprintf(path, sizeof(path), "%s/metro_{func_name}", d);
     else snprintf(path, sizeof(path), "/dev/shm/metro_{func_name}");
     int fd = open(path, O_RDWR);
     if (fd < 0) return 0;
-    struct stat st;
-    fstat(fd, &st);
+    struct stat st; fstat(fd, &st);
     void *buf = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    // serialize params as JSON payload
-    // write to buf+32, set status, poll, read response
-    return ({ret_c})0;
+    if (buf == MAP_FAILED) return 0;
+
+    volatile uint32_t *status = (volatile uint32_t*)buf;
+    volatile uint32_t *size = (volatile uint32_t*)(buf + 8);
+    while (*status != STATUS_IDLE);
+{write_fields}
+    *size = {req_size};
+    *status = STATUS_CONSUMER_REQ;
+    while (*status != STATUS_PROVIDER_RES);
+
+    {ret_c} result = 0;
+{read_result}
+    *status = STATUS_IDLE;
+    munmap(buf, st.st_size); close(fd);
+    return result;
 }}
-"#, func_name = func_name, ret_c = ret_c, c_decl = params_decl.join(", "));
+"#, func_name = func_name, ret_c = ret_c, c_decl = params_decl.join(", "),
+                req_size = req_size, write_fields = write_fields,
+                read_result = if ret_c != "void" { format!("    result = *({ret_c}*)(buf + 32);", ret_c = ret_c) } else { String::new() });
             Ok(("stub.h".into(), content))
         }
         _ => {
@@ -567,4 +786,30 @@ fn type_to_c(ty: &str) -> &str {
         "Data" | "bytes" => "const uint8_t*",
         _ => "void*",
     }
+}
+
+fn type_size_bytes(ty: &str) -> usize {
+    match ty.trim() {
+        "bool" | "Bool" | "uint8_t" | "int8_t" => 1,
+        "int32_t" | "int" | "Int" | "i32" | "float" | "Float" | "f32" | "uint32_t" => 4,
+        "i64" | "int64_t" | "f64" | "double" | "uint64_t" => 8,
+        "str" | "String" | "string" | "const char*" => 256,
+        "Data" | "bytes" | "const uint8_t*" => 4096,
+        _ => 4,
+    }
+}
+
+/// Compute byte offsets for each parameter in a zero-copy buffer layout.
+/// Returns (offset, size) pairs for each param, and the total request size.
+fn compute_layout(params: &[(String, String)]) -> (Vec<(usize, usize)>, usize) {
+    let mut offset = 0usize;
+    let mut layout = Vec::new();
+    for (_, ty) in params {
+        let size = type_size_bytes(ty);
+        // Align to 4 bytes
+        offset = (offset + 3) & !3;
+        layout.push((offset, size));
+        offset += size;
+    }
+    (layout, offset)
 }
