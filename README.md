@@ -1,101 +1,125 @@
 # metropipe
 
-**The Universal Language Binder** — Zero-copy shared memory IPC between any two languages. No C-ABI. No serialization. No wrappers.
+Share data between processes on the same machine using shared memory.
 
-## What
+Write to a buffer in one language, read it from another. Works with C, Go, Python, Java, Rust, JavaScript, C#, Ruby, Bash, and anything else that can open a file or read stdin.
 
-`metropipe` lets a Python script, a Node.js server, a C program, and a Brief reactor all exchange data through the same block of shared memory — at ~10ns latency, using atomic CAS for coordination. No function calls. No serialization. No `.so` files.
-
-The protocol is a 32-byte header + payload plane in `/dev/shm/metro_{service}`. Any language with `mmap` can participate.
-
-## Quick Start
-
-### 1. Install
+## Install
 
 ```bash
 cargo install metropipe
 ```
 
-Or download a pre-built binary from [releases](https://github.com/Randozart/metropipe/releases).
+Or download a pre-built binary from the [releases page](https://github.com/Randozart/metropipe/releases).
 
-### 2. Start the Daemon
+## Commands
+
+### `metropipe serve` — start the daemon
+
+Allocates shared memory channels in `/dev/shm/` and waits for clients.
 
 ```bash
 metropipe serve
 ```
 
-### 3. Connect from Any Language
+### `metropipe connect <name>` — interactive REPL
 
-```python
-# Python — requires metropipe to be running
-from metropipe_client import MetroClient
-with MetroClient("WeatherApi") as client:
-    result = client.send(b"New York", timeout_ms=5000)
-```
-
-```c
-/* C */
-#include "metropipe.h"
-MetroChannel ch;
-metro_channel_open(&ch, "/dev/shm/metro_WeatherApi");
-metro_channel_send(&ch, (uint8_t*)"New York", 8);
-uint8_t resp[1024];
-metro_channel_recv(&ch, resp, sizeof(resp), 5000);
-metro_channel_close(&ch);
-```
+Opens a channel, reads lines from stdin, sends each as a request, prints the response.
 
 ```bash
-# Any language with stdin/stdout
-echo "New York" | metropipe proxy WeatherApi > response.bin
+metropipe connect WeatherApi
+Connected to /dev/shm/metro_WeatherApi
+> New York
+Response: sunny, 72°F
 ```
 
-## See Also
+Flags:
+- `--send <data>` — one-shot: send once, print response, exit
+- `--listen` — act as the provider: receive requests, prompt for responses
+- `--gen-stubs [<dir>]` — generate client library files for 9 languages
 
-- [Brief Language](https://github.com/Randozart/brief-lang) — The Brief compiler (optional, for contract-verified daemon builds with `brief build metropipe.bv`)
-- [METROPOLITAN-SPEC.md](docs/METROPOLITAN-SPEC.md) — Full protocol specification
-- [PLAN.md](PLAN.md) — Development roadmap
+### `metropipe bind <library>` — generate client stubs
+
+Analyzes a library and generates `.dbv` + client stubs for all supported languages.
+
+```bash
+metropipe bind mylib.h
+Generated stubs for 'mylib' in lib/ffi/generated/mylib/
+```
+
+### `metropipe proxy <name>` — stdin/stdout bridge
+
+Wraps the shared memory handshake as a pipe. Any language that can read stdin and write stdout can participate.
+
+```bash
+echo "payload" | metropipe proxy WeatherApi > response.bin
+```
+
+Useful for: Bash scripts, AWK, Perl, PHP, Lua — anything without `mmap`.
+
+## Language Support
+
+| Language | File | How it connects |
+|----------|------|----------------|
+| C | `metropipe_<svc>.h` | mmap + atomic ops |
+| Go | `metropipe_<svc>.go` | syscall.Mmap |
+| Python | `metropipe_<svc>.py` | mmap |
+| Java | `metropipe_<svc>.java` | MappedByteBuffer |
+| Rust | `metropipe_<svc>.rs` | mmap + libc |
+| C# | `metropipe_<svc>.cs` | MemoryMappedFile |
+| JavaScript | `metropipe_<svc>.js` | SharedArrayBuffer |
+| Ruby | `metropipe_<svc>.rb` | IO.mmap |
+| Bash | `metropipe_<svc>.sh` | metropipe proxy |
+
+Generate stubs for any service:
+```bash
+metropipe connect WeatherApi --gen-stubs ./my_stubs
+```
 
 ## Protocol
 
-All channels use a 32-byte control header + variable-size payload:
+All channels use a 32-byte header at the start of the shared memory file:
 
-| Offset | Field | Values |
-|--------|-------|--------|
-| 0x00 | STATUS_WORD | 0=IDLE, 1=CONSUMER_REQ, 2=PROVIDER_ACK, 3=PROVIDER_RES, 4=ERROR |
-| 0x04 | CAS_LOCK | Atomic mutex |
-| 0x08 | PAYLOAD_SIZE | Bytes written |
-| 0x0C | MAX_CAPACITY | Max payload size |
-| 0x10 | ERROR_CODE | Error details |
-| 0x14 | RESERVED | Padding |
-| 0x20 | PAYLOAD | Data |
+| Offset | Size | Field | Meaning |
+|--------|------|-------|---------|
+| 0 | 4 | STATUS_WORD | 0=idle, 1=request, 3=response, 4=error |
+| 4 | 4 | CAS_LOCK | atomic mutex |
+| 8 | 4 | PAYLOAD_SIZE | bytes written |
+| 12 | 4 | MAX_CAPACITY | max payload |
+| 16 | 4 | ERROR_CODE | error detail |
+| 20 | 12 | (reserved) | padding |
+| 32 | variable | PAYLOAD | data |
 
-## Clients
+Communication follows: idle → consumer writes → consumer signals request → provider processes → provider signals response → consumer reads → idle.
 
-| Language | File |
-|----------|------|
-| C/C++ | `clients/c/metropipe.h` |
-| Python | `clients/python/metropipe.py` |
-| JavaScript/Node | `clients/javascript/metropipe.js` |
-| Brief | `lib/std/metro_bridge.bv` (via compiler) |
+## How it works
+
+1. `metropipe serve` creates a file at `/dev/shm/metro_<name>` with the 32-byte header + zero-filled payload.
+2. A client opens the file, memory-maps it, and writes a request to the payload region.
+3. The client sets STATUS_WORD to `1` (CONSUMER_REQ) via an atomic store.
+4. The provider polls STATUS_WORD. When it sees `1`, it processes the request and writes back.
+5. The provider sets STATUS_WORD to `3` (PROVIDER_RES) when done.
+6. The client reads the response and resets STATUS_WORD to `0` (IDLE).
+
+The same buffer, header, and handshake work for every language. No serialization, no function calls, no `.so` files.
 
 ## Project Structure
 
 ```
 metropipe/
-├── metropipe                  # Compiled binary
-├── src/metropipe.bv           # Daemon (Brief source)
-├── clients/
-│   ├── c/metropipe.h          # C header
-│   ├── python/metropipe.py    # Python client
-│   └── javascript/metropipe.js# Node.js client
-├── docs/METROPOLITAN-SPEC.md  # Full protocol spec
-├── examples/services.dbv      # Example service IDL
-├── PLAN.md                    # Development roadmap
-└── Makefile
+├── src/
+│   ├── main.rs            # CLI entry point
+│   ├── channel.rs         # 32-byte header protocol
+│   ├── server.rs          # daemon
+│   ├── connect.rs         # REPL / send / listen / gen-stubs
+│   ├── proxy.rs           # stdin/stdout bridge
+│   └── codegen.rs         # stub generator (9 languages)
+├── clients/               # reference client implementations
+├── docs/METROPOLITAN-SPEC.md
+└── Cargo.toml
 ```
 
-## See Also
+## Related
 
-- [METROPOLITAN-SPEC.md](docs/METROPOLITAN-SPEC.md) — Full protocol specification
-- [PLAN.md](PLAN.md) — Development roadmap
-- [../brief-compiler/](../brief-compiler/) — Brief compiler with `brief metropipe connect`
+- [Brief Language](https://github.com/Randozart/brief-lang) — optional, for contract-verified daemon builds
+- [docs/METROPOLITAN-SPEC.md](docs/METROPOLITAN-SPEC.md) — protocol specification
