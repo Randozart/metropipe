@@ -10,20 +10,50 @@ The protocol is a 32-byte header + payload plane in `/dev/shm/metro_{service}`. 
 
 ## Quick Start
 
-```bash
-# 1. Start the daemon
-./metropipe
+### 1. Install
 
-# 2. Connect from Python
-from metropipe import MetroClient
+```bash
+cargo install metropipe
+```
+
+Or download a pre-built binary from [releases](https://github.com/Randozart/metropipe/releases).
+
+### 2. Start the Daemon
+
+```bash
+metropipe serve
+```
+
+### 3. Connect from Any Language
+
+```python
+# Python — requires metropipe to be running
+from metropipe_client import MetroClient
 with MetroClient("WeatherApi") as client:
     result = client.send(b"New York", timeout_ms=5000)
-
-# 3. Or use the universal CLI
-brief metropipe connect WeatherApi
-> city = "New York"
-Response: temperature=72.5, humidity=0.45, condition="Sunny"
 ```
+
+```c
+/* C */
+#include "metropipe.h"
+MetroChannel ch;
+metro_channel_open(&ch, "/dev/shm/metro_WeatherApi");
+metro_channel_send(&ch, (uint8_t*)"New York", 8);
+uint8_t resp[1024];
+metro_channel_recv(&ch, resp, sizeof(resp), 5000);
+metro_channel_close(&ch);
+```
+
+```bash
+# Any language with stdin/stdout
+echo "New York" | metropipe proxy WeatherApi > response.bin
+```
+
+## See Also
+
+- [Brief Language](https://github.com/Randozart/brief-lang) — The Brief compiler (optional, for contract-verified daemon builds with `brief build metropipe.bv`)
+- [METROPOLITAN-SPEC.md](docs/METROPOLITAN-SPEC.md) — Full protocol specification
+- [PLAN.md](PLAN.md) — Development roadmap
 
 ## Protocol
 

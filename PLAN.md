@@ -1,188 +1,176 @@
 # metropipe — Universal Language Binder
 
-**Make any two languages talk at RAM speed. No C-ABI. No serialization. No wrappers.**
+**Weld any two languages together at the lowest level they're capable of welding.**
 
-## The Goal
+No C-ABI. No serialization. No wrappers. Just a block of shared memory and an atomic handshake — or a pipe, or a socket — depending on what the language can do.
 
-`metropipe` is a universal, zero-copy, language-agnostic shared-memory IPC bus. Any language with `mmap` (or `SharedArrayBuffer`, or MMIO) can talk to any other — at ~10ns latency, no serialization overhead, no function call ABI.
+## Philosophy
 
-The binary is a simple reactive daemon. `brief metropipe connect` is a CLI that makes it trivial to use.
+Every language has a lowest-common-denominator I/O capability. metropipe meets each language at that level:
 
-```bash
-# Start a service
-$ metropipe
+| Level | Transport | Latency | Languages |
+|-------|-----------|---------|-----------|
+| **Binary** | Shared memory (mmap, SharedArrayBuffer, MMIO) | ~10ns | C, Rust, Go, Python, Java, C#, Ruby, JS/Node, Zig, Nim, OCaml, D, Swift |
+| **Pipe** | stdin/stdout proxy | ~100μs | Bash, AWK, Perl, PHP, Lua, Tcl, Julia, R, Dart CLI, Elixir, Erlang, Haskell, OCaml |
+| **Socket** | TCP relay (via `metropipe bridge`) | ~1ms | Everything with HTTP — curl, PowerShell, Kotlin, MATLAB, Flutter, Blazor, VBA |
 
-# Connect from the command line (auto-detects schema)
-$ brief metropipe connect WeatherApi
-Connected to /dev/shm/metro_WeatherApi
-> city = "New York"
-Response: temperature=72.5, humidity=0.45, condition="Sunny"
+Each level is a strict superset of the one above. A Bash script talks to a Rust binary talks to a Python service — all through the same `/dev/shm/metro_*` buffer at the bottom.
 
-# Or generate client stubs for embeddng
-$ brief metropipe connect WeatherApi --gen-stubs
-  → metropipe_WeatherApi.h
-  → metropipe_WeatherApi.py
-  → metropipe_WeatherApi.js
-```
+## The Protocol (32-byte Header)
 
-## Architecture
+All channels use the same layout regardless of transport:
 
-```
-┌──────────┐     ┌──────────────────┐     ┌──────────┐
-│  Python  │────→│   shared memory  │←────│  Node.js │
-│  Client  │     │  /dev/shm/metro_*│     │  Client  │
-└──────────┘     │  32-byte header  │     └──────────┘
-                 │  + payload plane │
-┌──────────┐     │  atomic CAS lock │     ┌──────────┐
-│  C/C++   │────→│  status word     │←────│  Brief   │
-│  Client  │     └──────────────────┘     │  Runtime │
-└──────────┘                               └──────────┘
-```
-
-### The Protocol: 32-byte Header
-
-All fields are 32-bit LE u32:
-
-| Offset | Field | Description |
-|--------|-------|-------------|
+| Offset | Field | Values |
+|--------|-------|--------|
 | 0x00 | STATUS_WORD | 0=IDLE, 1=CONSUMER_REQ, 2=PROVIDER_ACK, 3=PROVIDER_RES, 4=ERROR |
 | 0x04 | CAS_LOCK | Atomic compare-and-swap mutex |
 | 0x08 | PAYLOAD_SIZE | Bytes written in payload |
 | 0x0C | MAX_CAPACITY | Maximum payload size |
-| 0x10 | ERROR_CODE | Error metadata if STATUS=4 |
+| 0x10 | ERROR_CODE | Error metadata on ERROR |
 | 0x14 | RESERVED | 12 bytes padding |
 | 0x20 | PAYLOAD | Raw byte data |
 
 Handshake: `IDLE → CONSUMER_REQ → PROVIDER_ACK → PROVIDER_RES → IDLE`
 
+## The Goal: One Command
+
+```bash
+# Analyze a foreign library, generate stubs for every language
+metropipe bind mylib.h
+  → lib/ffi/generated/mylib/service.dbv
+  → lib/ffi/generated/mylib/stub.c
+  → lib/ffi/generated/mylib/stub.py
+  → lib/ffi/generated/mylib/stub.js
+  → lib/ffi/generated/mylib/stub.rs
+  → lib/ffi/generated/mylib/stub.go
+  → lib/ffi/generated/mylib/stub.java
+  → lib/ffi/generated/mylib/stub.cs
+  → lib/ffi/generated/mylib/stub.rb
+
+# Connect from any language — even one without mmap
+metropipe proxy WeatherApi
+> New York
+Response: temperature=72.5, humidity=0.45, condition="Sunny"
+
+# Generate stubs for a specific service
+metropipe connect WeatherApi --gen-stubs
+  → metropipe_WeatherApi.h
+  → metropipe_WeatherApi.py
+  → metropipe_WeatherApi.js
+  → metropipe_WeatherApi.rs
+  → metropipe_WeatherApi.go
+
+# Start the daemon (allocates shared memory)
+metropipe serve
+
+# Use from bash (no mmap needed):
+echo "New York" | metropipe proxy WeatherApi > response.bin
+```
+
+## Architecture
+
+```
+┌──────────┐     ┌─────────────────────┐     ┌──────────┐
+│  Python  │────→│                     │←────│  Node.js │
+└──────────┘     │   /dev/shm/metro_*  │     └──────────┘
+                 │   32-byte header    │
+┌──────────┐     │   + payload plane   │     ┌──────────┐
+│  Rust    │────→│   atomic CAS lock   │←────│  C/C++   │
+└──────────┘     └──────────┬──────────┘     └──────────┘
+                           │
+                    ┌──────┴──────┐
+                    │  metropipe  │
+                    │   proxy    │←── stdin/stdout (bash, awk, perl, ...)
+                    └─────────────┘
+```
+
+## Project Structure
+
+```
+metropipe/
+├── Cargo.toml              # Standalone Rust binary (no brief-compiler dep)
+├── src/
+│   ├── main.rs             # CLI: serve, connect, bind, proxy
+│   ├── server.rs           # Daemon: shm_open + reactive poll loop
+│   ├── channel.rs          # 32-byte header protocol helpers
+│   ├── connect.rs          # REPL, --send, --listen, --gen-stubs
+│   ├── codegen.rs          # Stub generation for 9+ languages
+│   ├── proxy.rs            # stdin/stdout bridge for non-mmap languages
+│   └── bind.rs             # Analyze library → .dbv + stubs
+├── clients/
+│   ├── c/metropipe.h       # C header (mmap)
+│   ├── python/metropipe.py # Python client (mmap)
+│   ├── javascript/metropipe.js # Node.js client (SharedArrayBuffer)
+│   ├── rust/metropipe.rs   # Rust module (mmap + libc)
+│   ├── go/metropipe.go     # Go package (syscall.Mmap)
+│   ├── java/MetroChannel.java  # Java class (MappedByteBuffer)
+│   ├── csharp/MetroChannel.cs  # C# class (MemoryMappedFile)
+│   └── ruby/metropipe.rb   # Ruby module (IO.mmap)
+├── docs/METROPOLITAN-SPEC.md
+├── PLAN.md
+└── README.md
+```
+
 ## Phases
 
-### Phase R: Rename (2 hours)
+### Phase R: Rename (✅ DONE)
+`metrod` → `metropipe`. Folder, binary, docs, all references.
 
-**Files to rename in metropipe repo:**
-- `src/metrod.bv` → `src/metropipe.bv`
-- `clients/python/metro.py` → `clients/python/metropipe.py`
-- `clients/python/__init__.py` (create, exports MetroClient/MetroBroker as aliases)
-- `clients/javascript/metro.js` → `clients/javascript/metropipe.js`
-- `clients/c/metro.h` → `clients/c/metropipe.h`
-- `Makefile` — update binary name, target names
-- `README.md` — full rewrite as metropipe
+### Phase H: `metropipe bind` — Service Generation (in progress)
+`metropipe bind mylib.h` emits `.dbv` IDL + client stubs for all languages.
 
-**References in brief-compiler:**
-- `src/ffi/metro_cli.rs` — rename internal strings, command name "metrod"→"metropipe"
-- `src/main.rs` — update help text for `brief metropipe connect`
-- `lib/std/metro_bridge.bv` — update doc comments
-- `src/ffi/metropolitan.rs` — update codegen header guards/comments
+Files: `src/bind.rs`, `src/codegen.rs`, `clients/*`
 
----
+### Phase I: `metropipe connect` — Full RPC (2 days)
+True 32-byte protocol REPL, `--send`, `--listen`, `--gen-stubs`.
 
-### Phase G: Protocol Alignment (3 days)
+Files: `src/connect.rs`
 
-**G1 — `generate_metropipe_c_header()` in `metropolitan.rs`**
+### Phase J: `metropipe serve` — Daemon (1 week)
+Real shm_open/ftruncate/mmap via the daemon. Service registry. Hot-reload.
 
-Current `generate_c_header()` emits the 3-region protocol (separate req/resp/sync regions with 64-bit status words). Add a second codegen path that emits metropipe's single-region 32-byte header protocol:
+Files: `src/server.rs`, `metropipe.bv` (optional reference)
 
-```rust
-pub fn generate_metropipe_c_header(&self, channel_id: &str) -> Result<String, String>
-pub fn generate_metropipe_python_module(&self, channel_id: &str) -> Result<String, String>
-pub fn generate_metropipe_js_module(&self, channel_id: &str) -> Result<String, String>
-```
+### Phase K: Brief Reference Implementation (3 days)
+The daemon in Brief (`metropipe.bv`) — contract-verified version of the Rust daemon.
+Proves the FFI cycle: Brief daemon → generated stubs → any language.
 
-The output must exactly match the `clients/c/metropipe.h` layout (same offsets, same status word values, same atomic CAS handshake).
+Files: `src/metropipe.bv`, `lib/std/metropipe_gen.bv`
 
-**G2 — Wire into `brief metropipe connect` CLI**
-
-- `--lang c` → use `generate_metropipe_c_header()`
-- `--lang python` → use `generate_metropipe_python_module()`
-- `--lang js` → use `generate_metropipe_js_module()`
-
-**G3 — Update `metro_bridge.bv`**
-
-The frgn declarations need to work with the 32-byte header offsets. The bridge currently uses native Rust impls (shm_open, mmap, atomic CAS) — these are OS-level calls that work regardless of the header layout. Update `metropolitan_rpc()` to write at the correct offsets (0x20 for payload, 0x00 for status, etc.)
-
----
-
-### Phase H: `brief bind` → `.dbv` Services (2 days)
-
-When `brief bind mylib.h` runs, additionally emit:
-
-- **`service.dbv`**: Metropolitan IDL definition (SERVICE/INPUT/OUTPUT)
-- **`metropipe_stub.h`**: C client header using the 32-byte protocol
-- **`metropipe_stub.py`**: Python client using the 32-byte protocol
-- **`metropipe_stub.js`**: JS client using the 32-byte protocol
-- **`memory-spec.json`**: Field offset/size layout for schema-aware clients
-
-This makes `brief bind` produce a fully working cross-language service in one command:
+### Phase L: `metropipe proxy` — stdin/stdout Bridge (1 day)
+Wraps shared memory handshake as stdin/stdout. Every language with text I/O becomes a client.
 
 ```bash
-$ brief bind mylib.h --gen-stubs
-  Analyzed 12 functions in mylib.h
-  Generated:
-    lib/ffi/generated/mylib/bridge.bv      # Brief frgn declarations
-    lib/ffi/generated/mylib/service.dbv    # Metropolitan IDL
-    lib/ffi/generated/mylib/metropipe_stub.h  # C client
-    lib/ffi/generated/mylib/metropipe_stub.py # Python client
-    lib/ffi/generated/mylib/metropipe_stub.js  # JS client
-    lib/ffi/generated/mylib/memory-spec.json   # Schema layout
-
-Now connect any language: metropipe connect mylib
+echo "payload" | metropipe proxy WeatherApi > response.bin
 ```
 
----
+Files: `src/proxy.rs`
 
-### Phase I: `brief metropipe connect` Full RPC (2 days)
+### Phase S: Standalone Binary (1 day)
+`cargo install metropipe` — zero dependencies. The brief-compiler becomes optional.
 
-The CLI currently exists (`src/ffi/metro_cli.rs`) but uses the old 3-region protocol. Rewrite to:
+Files: `Cargo.toml`, `src/main.rs`
 
-1. **True 32-byte protocol**: Opens `/dev/shm/metro_{name}`, implements the spec handshake
-2. **Schema-aware REPL**: If `memory-spec.json` exists, shows field names and types, accepts structured input
-3. **`--listen` mode**: Act as a provider — receives requests, prompts for response
-4. **`--gen-stubs` mode**: Generate embeddable client library files
-5. **Raw mode**: Work without a schema (just send/receive raw bytes)
-
-```bash
-$ brief metropipe connect WeatherApi         # Schema-aware REPL
-$ brief metropipe connect WeatherApi --raw   # Raw byte mode
-$ brief metropipe connect WeatherApi --listen  # Act as provider
-$ brief metropipe connect WeatherApi --gen-stubs  # Generate stubs
-```
-
----
-
-### Phase J: Daemon Expansion (1 week)
-
-The current daemon (`src/metropipe.bv`) is 110 lines of reactive state machines that track `service_count` in `let` variables. It does NOT actually allocate shared memory.
-
-1. **Actual shm_alloc**: Use the metropolitan FFI bridge (`__shm_open`, `__ftruncate`, `__mmap_anonymous`) to create real `/dev/shm/metro_{name}` files when a service is registered
-2. **Real registry**: A `Map<String, ServiceDef>` storing service names → schemas → memory addresses
-3. **Hot-reload**: Watch a directory for `.dbv` files; auto-register services when files appear
-4. **Health check**: Expose status via a unix socket or a well-known shared memory path (`/dev/shm/metro__health`)
-
----
-
-### Phase K: Stub Generators in Brief (3 days)
-
-Write a Brief program that reads a `.dbv` service definition and emits C/Python/JS client stubs using string operations and the metropolitan FFI bridge for file I/O.
-
-This proves the full FFI cycle:
+## Welding Hierarchy — Complete
 
 ```
-Brief daemon (metropipe.bv)       — reactive state machine managing shared memory
-Brief bridge (metro_bridge.bv)    — frgn declarations for OS primitives
-Brief stub generator (NEW)        — reads .dbv, emits C/Python/JS stubs
-Generated stubs talk to daemon    — via shared memory, same protocol
-All via brief metropipe connect    — the CLI that ties it together
+Language capable of mmap?
+  ├── yes → use mmap directly (~10ns)
+  │         C, Rust, Go, Python, Java, C#, Ruby, JS/Node, ...
+  │
+  ├── yes but only SharedArrayBuffer?
+  │     └── use Atomics (~10ns)
+  │         Browser JS, TypeScript, Dart/Flutter Web
+  │
+  ├── no mmap, but has stdin/stdout?
+  │     └── use metropipe proxy (~100μs)
+  │         Bash, AWK, Perl, PHP, Lua, Tcl, Julia, R, ...
+  │
+  └── no stdin/stdout (HTTP only)?
+        └── use metropipe bridge (~1ms)
+            curl, PowerShell, VBA, MATLAB, ...
 ```
 
----
+## License
 
-## Files Changed Per Phase
-
-| Phase | Files |
-|-------|-------|
-| **R** | `metropipe/` folder rename, `src/metro_cli.rs`, `src/main.rs`, `lib/std/metro_bridge.bv`, `src/ffi/metropolitan.rs` |
-| **G** | `src/ffi/metropolitan.rs`, `src/ffi/metro_cli.rs`, `lib/std/metro_bridge.bv` |
-| **H** | `src/wrapper/generator.rs`, `src/wrapper/mod.rs`, `src/ffi/metropolitan.rs` |
-| **I** | `src/ffi/metro_cli.rs` → `src/ffi/metropipe_cli.rs` |
-| **J** | `metropipe/src/metropipe.bv` |
-| **K** | `lib/std/metropipe_gen.bv` (NEW) |
+Apache 2.0 with runtime exception

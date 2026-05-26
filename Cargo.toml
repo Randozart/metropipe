@@ -1,0 +1,12 @@
+[package]
+name = "metropipe"
+version = "1.0.0"
+edition = "2021"
+description = "Universal Language Binder — weld any two languages at the lowest I/O level they support"
+authors = ["Randy Smits-Schreuder Goedheijt"]
+license = "Apache-2.0"
+repository = "https://github.com/Randozart/metropipe"
+
+[dependencies]
+serde_json = "1.0"
+libc = "0.2"
