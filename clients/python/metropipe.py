@@ -1,6 +1,6 @@
 """
-Metropolitan FFI Client - Python
-Zero-copy shared memory communication with Metro Daemon services.
+metropipe — Universal Language Binder
+Python client — zero-copy shared memory IPC via the Metropolitan protocol.
 
 Usage:
     from metro import MetroClient

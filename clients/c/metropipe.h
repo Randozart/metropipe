@@ -1,24 +1,21 @@
 /*
- * Metropolitan FFI Client - C Header
- * Zero-copy shared memory communication with Metro Daemon services.
+ * metropipe - Universal Language Binder
+ * C client — zero-copy shared memory IPC via the Metropolitan protocol.
  *
  * Usage:
- *   #include "metro.h"
+ *   #include "metropipe.h"
  *
  *   MetroChannel ch;
  *   metro_channel_open(&ch, "/dev/shm/metro_WeatherApi");
- *
  *   uint8_t request[] = "New York";
  *   metro_channel_send(&ch, request, sizeof(request));
- *
  *   uint8_t response[1024];
  *   int len = metro_channel_recv(&ch, response, sizeof(response), 5000);
- *
  *   metro_channel_close(&ch);
  */
 
-#ifndef METRO_H
-#define METRO_H
+#ifndef METROPIPE_H
+#define METROPIPE_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -172,4 +169,4 @@ int metro_broker_list(char names[][64], int max_count);
 }
 #endif
 
-#endif /* METRO_H */
+#endif /* METROPIPE_H */

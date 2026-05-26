@@ -1,170 +1,71 @@
-# Metro Daemon (metrod)
+# metropipe
 
-**The Metropolitan FFI Broker** — A universal, zero-copy, language-agnostic IPC protocol.
+**The Universal Language Binder** — Zero-copy shared memory IPC between any two languages. No C-ABI. No serialization. No wrappers.
 
-Metro Daemon manages shared-memory service registration and lookup, enabling any programming language to communicate with any other at the speed of RAM — no serialization, no network stack, no C-ABI wrappers. This is accomplished by using the Brief programming language.
+## What
 
-## Architecture
+`metropipe` lets a Python script, a Node.js server, a C program, and a Brief reactor all exchange data through the same block of shared memory — at ~10ns latency, using atomic CAS for coordination. No function calls. No serialization. No `.so` files.
 
-```
-┌──────────────┐     .dbv IDL     ┌─────────────┐     memory-spec.json     ┌──────────────┐
-│   Python     │ ───────────────► │  metrod     │ ◄────────────────────── │   Node.js    │
-│   Client     │                  │  (Brief)    │                         │   Client     │
-└──────────────┘                  └──────┬──────┘                         └──────────────┘
-                                         │
-                                  /dev/shm/metro_*
-                                  (shared memory)
-                                         │
-┌──────────────┐                  ┌──────┴──────┐                         ┌──────────────┐
-│   Rust       │ ◄──────────────► │  Metro FFI  │ ◄────────────────────── │   C/C++      │
-│   Client     │                  │  Protocol   │                         │   Client     │
-└──────────────┘                  └─────────────┘                         └──────────────┘
-```
-
-## The Metropolitan Stack
-
-| Layer | Component | Description |
-|-------|-----------|-------------|
-| **Protocol** | Metropolitan FFI | 32-byte header, atomic CAS, status words |
-| **IDL** | `.dbv` files | Service schema definitions (d-brief format) |
-| **Broker** | `metrod` | Shared memory allocator and registry |
-| **Clients** | Python, JS, C | Language-specific client libraries |
+The protocol is a 32-byte header + payload plane in `/dev/shm/metro_{service}`. Any language with `mmap` can participate.
 
 ## Quick Start
 
-### 1. Build the Brief Compiler
-
 ```bash
-cd ../brief-compiler
-cargo build --release
-```
+# 1. Start the daemon
+./metropipe
 
-### 2. Compile the Metro Daemon
-
-```bash
-cd ../brief-compiler
-./target/release/brief-compiler build ../metrod/src/metrod.bv
-cp metrod ../metrod/metrod
-```
-
-Or simply:
-
-```bash
-make build
-```
-
-The compiled binary lands at `./metrod` (3.9 MB native executable).
-
-### 3. Run the Daemon
-
-```bash
-./metrod
-```
-
-The daemon starts as a reactive state machine, initializing its service registry
-and waiting for commands via shared memory variables.
-
-### 4. Define a Service (IDL)
-
-Create a `weather.dbv` file:
-
-```brief
-SERVICE WeatherApi {
-    INPUT city: String;
-    OUTPUT temperature: Float;
-    OUTPUT humidity: Float;
-    OUTPUT condition: String;
-}
-```
-
-### 5. Use from Python
-
-```python
-from metro import MetroClient
-
+# 2. Connect from Python
+from metropipe import MetroClient
 with MetroClient("WeatherApi") as client:
-    # Pack request: city name as bytes
-    request = b"New York\x00" * 32  # 256 bytes
-    response = client.send(request, timeout_ms=5000)
-    print(f"Got {len(response)} bytes response")
+    result = client.send(b"New York", timeout_ms=5000)
+
+# 3. Or use the universal CLI
+brief metropipe connect WeatherApi
+> city = "New York"
+Response: temperature=72.5, humidity=0.45, condition="Sunny"
 ```
 
-### 6. Use from Node.js
+## Protocol
 
-```javascript
-const { MetroClient } = require('./clients/javascript/metro.js');
+All channels use a 32-byte control header + variable-size payload:
 
-const client = new MetroClient('WeatherApi');
-const request = Buffer.alloc(256, 0);
-request.write('New York');
-const response = await client.request(request);
-console.log(`Got ${response.length} bytes response`);
-client.close();
-```
+| Offset | Field | Values |
+|--------|-------|--------|
+| 0x00 | STATUS_WORD | 0=IDLE, 1=CONSUMER_REQ, 2=PROVIDER_ACK, 3=PROVIDER_RES, 4=ERROR |
+| 0x04 | CAS_LOCK | Atomic mutex |
+| 0x08 | PAYLOAD_SIZE | Bytes written |
+| 0x0C | MAX_CAPACITY | Max payload size |
+| 0x10 | ERROR_CODE | Error details |
+| 0x14 | RESERVED | Padding |
+| 0x20 | PAYLOAD | Data |
 
-### 7. Use from C
+## Clients
 
-```c
-#include "clients/c/metro.h"
-
-int main() {
-    MetroChannel ch;
-    metro_channel_open(&ch, "/dev/shm/metro_WeatherApi");
-
-    uint8_t request[256] = {0};
-    memcpy(request, "New York", 8);
-    metro_channel_send(&ch, request, 256);
-
-    uint8_t response[1024];
-    int len = metro_channel_recv(&ch, response, sizeof(response), 5000);
-
-    metro_channel_close(&ch);
-    return 0;
-}
-```
-
-## Protocol Spec
-
-See [docs/METROPOLITAN-SPEC.md](docs/METROPOLITAN-SPEC.md) for the full technical specification, including:
-- 32-byte header layout
-- Status word lifecycle
-- Handshake protocol
-- Reference implementations
-- Hardware (FPGA) synthesis
+| Language | File |
+|----------|------|
+| C/C++ | `clients/c/metropipe.h` |
+| Python | `clients/python/metropipe.py` |
+| JavaScript/Node | `clients/javascript/metropipe.js` |
+| Brief | `lib/std/metro_bridge.bv` (via compiler) |
 
 ## Project Structure
 
 ```
-metrod/
-├── metrod                       # Compiled binary (native executable)
-├── src/
-│   └── metrod.bv                # Metro Daemon (Brief source)
-├── examples/
-│   └── services.dbv             # Example service IDL definitions
+metropipe/
+├── metropipe                  # Compiled binary
+├── src/metropipe.bv           # Daemon (Brief source)
 ├── clients/
-│   ├── python/metro.py          # Python client library
-│   ├── javascript/metro.js      # Node.js client library
-│   └── c/metro.h                # C client header
-├── docs/
-│   └── METROPOLITAN-SPEC.md     # Protocol specification
-├── Makefile
-└── README.md
+│   ├── c/metropipe.h          # C header
+│   ├── python/metropipe.py    # Python client
+│   └── javascript/metropipe.js# Node.js client
+├── docs/METROPOLITAN-SPEC.md  # Full protocol spec
+├── examples/services.dbv      # Example service IDL
+├── PLAN.md                    # Development roadmap
+└── Makefile
 ```
 
-## Why Metropolitan?
+## See Also
 
-| Feature | Metropolitan | gRPC | Redis |
-|---------|-------------|------|-------|
-| Latency | ~10ns | ~1-10ms | ~1ms |
-| Serialization | Zero-copy | Protobuf | RESP |
-| Cross-language | Any with mmap | Language-specific | Any with TCP |
-| FPGA support | Yes (MMIO) | No | No |
-| Blocking | Non-blocking | Blocking | Blocking |
-
-## License
-
-Apache License 2.0 with runtime exception
-
-## Author
-
-Randy Smits-Schreuder Goedheijt
+- [METROPOLITAN-SPEC.md](docs/METROPOLITAN-SPEC.md) — Full protocol specification
+- [PLAN.md](PLAN.md) — Development roadmap
+- [../brief-compiler/](../brief-compiler/) — Brief compiler with `brief metropipe connect`

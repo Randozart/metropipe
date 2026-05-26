@@ -1,6 +1,6 @@
 /**
- * Metropolitan FFI Client - JavaScript/Node.js
- * Zero-copy shared memory communication with Metro Daemon services.
+ * metropipe — Universal Language Binder
+ * JavaScript/Node.js client — zero-copy shared memory IPC via the Metropolitan protocol.
  *
  * Usage:
  *   const { MetroClient } = require('./metro.js');
