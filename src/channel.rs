@@ -30,6 +30,54 @@ pub const STATUS_ERROR: u32 = 4;
 /// Default capacity for new channels
 pub const DEFAULT_CAPACITY: usize = 4096;
 
+/// Resolve the shared memory path for a service name.
+///
+/// Tries in order:
+/// 1. `$METROPIPE_DIR/metro_<name>` (env var override)
+/// 2. `/dev/shm/metro_<name>` (Linux)
+/// 3. `/tmp/metro_<name>` (macOS, Docker)
+/// 4. `$TMPDIR/metro_<name>` (standard temp)
+/// 5. `./.metropipe/metro_<name>` (current dir — works everywhere)
+///
+/// The first existing path wins. If none exist, picks the best writable candidate.
+pub fn resolve_shm_path(name: &str) -> String {
+    if let Ok(dir) = std::env::var("METROPIPE_DIR") {
+        return format!("{}/metro_{}", dir, name);
+    }
+
+    let candidates = vec![
+        format!("/dev/shm/metro_{}", name),
+        format!("/tmp/metro_{}", name),
+        format!("{}/metro_{}", std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()), name),
+        format!(".metropipe/metro_{}", name),
+    ];
+
+    for c in &candidates {
+        if std::path::Path::new(c).exists() {
+            return c.clone();
+        }
+    }
+
+    // None exist — pick best candidate for this platform
+    if std::path::Path::new("/dev/shm").exists() {
+        candidates[0].clone()
+    } else if std::path::Path::new("/tmp").exists() {
+        candidates[1].clone()
+    } else {
+        candidates[3].clone()
+    }
+}
+
+/// Ensure the directory for a shared memory path exists.
+pub fn ensure_dir(path: &str) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
 /// Read a little-endian u32 from a byte buffer at the given offset.
 pub fn read_u32(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([

@@ -1,6 +1,5 @@
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
 
 use crate::channel;
 
@@ -11,10 +10,9 @@ use crate::channel;
 /// - `--send <payload>`: one-shot RPC
 /// - `--listen`: act as a provider (receive requests, prompt for responses)
 /// - `--gen-stubs [<dir>]`: generate client stub files
-/// Run the metropipe connect CLI.
 pub fn run_connect(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let service_name = &args[0];
-    let shm_path = format!("/dev/shm/metro_{}", service_name);
+    let shm_path = channel::resolve_shm_path(service_name);
 
     // Parse flags
     let mut send_payload: Option<String> = None;
@@ -47,16 +45,15 @@ pub fn run_connect(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Check if the shared memory exists; create it if not (like metropipe allocates)
-    if !Path::new(&shm_path).exists() {
-        eprintln!("Note: {} not found. Allocating...", shm_path);
+    // Check if the shared memory exists; create it if not
+    if !std::path::Path::new(&shm_path).exists() {
+        channel::ensure_dir(&shm_path)?;
         let fd = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(&shm_path)?;
         fd.set_len((channel::HEADER_SIZE + channel::DEFAULT_CAPACITY) as u64)?;
-        eprintln!("  Allocated {} bytes", channel::HEADER_SIZE + channel::DEFAULT_CAPACITY);
     }
 
     // Open and mmap the channel
@@ -82,7 +79,7 @@ pub fn run_connect(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Generate stubs if requested
     if gen_stubs {
-        let dir = Path::new(&stubs_dir);
+        let dir = std::path::Path::new(&stubs_dir);
         std::fs::create_dir_all(dir)?;
         crate::codegen::generate_stubs_to_dir(service_name, dir)?;
         println!("Stubs generated in {}", stubs_dir);

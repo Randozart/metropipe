@@ -1,8 +1,8 @@
 # metropipe
 
-Share data between processes on the same machine using shared memory.
+Pass data between processes on the same machine using shared memory. Works on Linux, macOS, Docker, WSL — everywhere.
 
-Write to a buffer in one language, read it from another. Works with C, Go, Python, Java, Rust, JavaScript, C#, Ruby, Bash, and anything else that can open a file or read stdin.
+Write to a buffer in one language, read it from another. No server, no daemon, no setup.
 
 ## Install
 
@@ -10,46 +10,40 @@ Write to a buffer in one language, read it from another. Works with C, Go, Pytho
 cargo install metropipe
 ```
 
-Or download a pre-built binary from the [releases page](https://github.com/Randozart/metropipe/releases).
+Or download a [pre-built binary](https://github.com/Randozart/metropipe/releases).
 
-## Commands
-
-### `metropipe connect <name>` — send and receive over shared memory
-
-Creates the channel if it doesn't exist, then connects. Default mode is an interactive REPL.
+## Usage
 
 ```bash
+# Connect to a service — creates the channel if it doesn't exist
 metropipe connect WeatherApi
-Connected to /dev/shm/metro_WeatherApi
 > New York
 Response: sunny, 72°F
-```
 
-Flags:
-- `--send <data>` — one-shot: send once, print response, exit
-- `--listen` — act as the provider: receive requests, prompt for responses
-- `--gen-stubs [<dir>]` — generate client library files for 9 languages
+# One-shot mode
+metropipe connect WeatherApi --send "London"
 
-No server or daemon needed. The shared memory file IS the channel — any process can create it.
+# Act as the provider (receive and respond to requests)
+metropipe connect WeatherApi --listen
 
-### `metropipe bind <library>` — generate client stubs
+# Generate client stubs for 9 languages
+metropipe connect WeatherApi --gen-stubs
 
-Analyzes a library and generates `.dbv` + client stubs for all supported languages.
+# stdin/stdout bridge — for languages without mmap
+echo "New York" | metropipe proxy WeatherApi > response.bin
 
-```bash
+# Generate stubs from a library file
 metropipe bind mylib.h
-Generated stubs for 'mylib' in lib/ffi/generated/mylib/
 ```
 
-### `metropipe proxy <name>` — stdin/stdout bridge
+## How it works
 
-Wraps the shared memory handshake as a pipe. Any language that can read stdin and write stdout can participate.
+1. The first process to use a channel creates a file at `/dev/shm/metro_<name>` (or `/tmp/metro_<name>` on macOS, or `./.metropipe/metro_<name>` as fallback).
+2. Processes open + mmap the file and exchange data through a 32-byte header + payload area.
+3. A consumer writes data, sets STATUS to CONSUMER_REQ, the provider sees it and responds, sets STATUS to PROVIDER_RES, consumer reads and resets to IDLE.
+4. The file itself IS the channel. No server, no central registry. Set `$METROPIPE_DIR` to override the storage directory.
 
-```bash
-echo "payload" | metropipe proxy WeatherApi > response.bin
-```
-
-Useful for: Bash scripts, AWK, Perl, PHP, Lua — anything without `mmap`.
+The same file, same header layout, same atomic handshake works in every language.
 
 ## Language Support
 

@@ -1,19 +1,15 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
 
 use crate::channel;
 
 /// Run the metropipe stdin/stdout bridge for non-mmap languages.
-///
-/// Reads lines from stdin, sends each as a request via shared memory,
-/// and writes responses to stdout. Any language with text I/O can participate.
 pub fn run_proxy(service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let shm_path = format!("/dev/shm/metro_{}", service_name);
+    let shm_path = channel::resolve_shm_path(service_name);
 
     // Allocate channel if it doesn't exist
-    if !Path::new(&shm_path).exists() {
+    if !std::path::Path::new(&shm_path).exists() {
         eprintln!("Note: allocating {}", shm_path);
         let fd = OpenOptions::new()
             .create(true)

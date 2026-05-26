@@ -48,16 +48,18 @@ fn write_file(dir: &Path, name: &str, content: &str) -> Result<(), String> {
 
 /// Generate C header stub for a service.
 fn generate_c_stub(name: &str, dir: &Path) -> Result<(), String> {
+    let uname = name.to_uppercase();
     let h = format!(r#"
-#ifndef METROPIPE_{0}_H
-#define METROPIPE_{0}_H
+#ifndef METROPIPE_{uname}_H
+#define METROPIPE_{uname}_H
 
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#define METRO_SERVICE "{1}"
-#define METRO_SHM_PATH "/dev/shm/metro_{1}"
 #define METRO_HEADER_SIZE 32
 #define METRO_OFFSET_PAYLOAD 32
 #define METRO_CAPACITY 4096
@@ -66,6 +68,17 @@ fn generate_c_stub(name: &str, dir: &Path) -> Result<(), String> {
 #define METRO_STATUS_CONSUMER_REQ 1
 #define METRO_STATUS_PROVIDER_RES 3
 
+// Resolve shm path: $METROPIPE_DIR, /dev/shm, /tmp, ./.metropipe
+static inline void metro_resolve_path(const char *svc, char *out, size_t len) {{
+    const char *d = getenv("METROPIPE_DIR");
+    if (d) {{ snprintf(out, len, "%s/metro_%s", d, svc); return; }}
+    snprintf(out, len, "/dev/shm/metro_%s", svc);
+    if (access(out, F_OK) == 0) return;
+    snprintf(out, len, "/tmp/metro_%s", svc);
+    if (access(out, F_OK) == 0) return;
+    snprintf(out, len, ".metropipe/metro_%s", svc);
+}}
+
 typedef struct {{
     volatile uint32_t *header;
     volatile uint8_t  *payload;
@@ -73,12 +86,13 @@ typedef struct {{
     int fd;
 }} MetroChannel;
 
-int metro_channel_open(MetroChannel *ch, const char *shm_path);
+int metro_channel_open(MetroChannel *ch, const char *svc);
 int metro_channel_send(MetroChannel *ch, const uint8_t *data, size_t len);
 int metro_channel_recv(MetroChannel *ch, uint8_t *out, size_t max_len, int timeout_ms);
 
 #endif
-"#, name.to_uppercase(), name);
+"#, uname = uname);
+
     write_file(dir, &format!("metropipe_{}.h", name), &h)
 }
 
